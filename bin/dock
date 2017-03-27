@@ -478,25 +478,25 @@ extend_container() {
 
   notice "Extending Dock: $1..."
 
-  # set image and container names accordingly
+  # Set image and container names accordingly.
+  # We use the image to store Dock container state (with the exception of volume details
+  # for obvious reasons with respect to how Docker operates) and inherit from during subsequent
+  # extension operations
   container_name "$(convert_to_valid_container_name $1)"
   image "dock-image:$container_name"
 
   # set workspace directory to project repo root
+  # This step is necessary to ensure that project src is copied into a directory unique to it
   workspace_path "$(pwd)"
 
-  # automatically detach from container to allow for build process to continue and
-  # saving of intermediate container state as image to occur
+  # automatically detach from container to allow for process to continue after container
+  # (re)creation and allow saving of intermediate container state as image to occur
   detach true
 
   # add Dock environment construction labels
   label "dock.${project}" "$(pwd)/.dock"
   label "compose.${project}" "$(pwd)/docker-compose.yml"
 
-  # proceed to launch extended dock container...
-  # TODO: refactor below common setup (i.e. build of docker run args) to remove code
-  # duplication
-  #
   # If we're already inside a Dock environment, just execute the command.
   # This allows us to reuse scripts with dock in their shebang line in other
   # Dock-ified scripts without invoking dock-within-dock (which is likely not what
@@ -508,34 +508,46 @@ extend_container() {
   # Compile run args based on current configuration
   compile_run_args
 
-  # If the targeted dock environment does not exist, create a new image
-  # based on the dock configuration of the current project
+  # Proceed to launch extended dock container...
   temp_container_name="temp"
   if ! container_exists $container_name; then
-    if [ -n "$dockerfile" ]; then
-      notice "Dock container $container_name not found, extending $project into new Dock $container_name..."
-      if $pull; then
-        build_args+=("--pull")
-      fi
-      build_args+=("--file" "$dockerfile" "--tag" "$image" "$build_context")
-      if quiet; then
-        "${build_args[@]}" 2>&1 >/dev/null
-      else
-        "${build_args[@]}"
-      fi
-      notice "$dockerfile built into $image!"
-    else
-      error "Must specify a Dockerfile to build and run!"
-      info "(is there a $default_conf_file file in your current directory?)"
-      return 1
-    fi
+    # If the targeted dock environment does not exist, create a new image
+    # based on the dock configuration of the current project
+    notice "Dock container $container_name NOT found; creating new Dock $container_name for $project..."
   else
     # Target container matches existing Dock container, reuse...
+    info "Dock container $container_name found, extending for $project..."
+    if [ -n "$dockerfile" ]; then
+      # Identify image of existing Dock container and build against it
+      local dock_image=$(docker inspect --format='{{ .Config.Image }}' $container_name)
+      sed "s|FROM.*|FROM ${dock_image}|" "$dockerfile" > "${build_context}/temp_dockerfile"
+      dockerfile "${build_context}/temp_dockerfile"
+    fi
     # Rename existing container to $temp_container_name so that we can launch the replacement container with
     # the exact same name and still have access to the previous version of the container's
     # volumes
     docker rename $container_name $temp_container_name
     run_args+=("--volumes-from" "$temp_container_name")
+
+    # Ensure we don't attempt to pull the temp FROM image from the hub since it is only for intermediary
+    # construction purposes and should not exist
+    pull=false
+  fi
+
+  # Build the project's dockerfile if necessary
+  if [ -n "$dockerfile" ]; then
+    if $pull; then
+      build_args+=("--pull")
+    fi
+    build_args+=("--file" "$dockerfile" "--tag" "$image" "$build_context")
+    if quiet; then
+      "${build_args[@]}" 2>&1 >/dev/null
+    else
+      "${build_args[@]}"
+    fi
+    notice "Built $project dockerfile into $image!"
+    # Cleanup the temporary dockerfile if necessary
+    rm --force "${build_context}/temp_dockerfile"
   fi
 
   run_args+=("$image")
@@ -550,14 +562,13 @@ extend_container() {
   fi
 
   docker commit $container_name $image 2>&1 >/dev/null
-
   # Cleanup intermediary temporary container if necessary
   if container_exists $temp_container_name; then
     docker stop $temp_container_name 2>&1 >/dev/null || true
     docker rm $temp_container_name 2>&1 >/dev/null || true
   fi
 
-  success "$container_name has successfully been extended!"
+  success "Dock $container_name has successfully been extended!"
 }
 
 get_labels() {
