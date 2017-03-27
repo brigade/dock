@@ -7,17 +7,11 @@ dockerfile Dockerfile
 # explicitly want to test that!
 dock_in_dock true
 
-# Running a Docker daemon inside the container requires additional privileges
-privileged true
-
 # Execute this script with the original command arguments passed to it
 entrypoint script/entrypoint.bash
 
 # Ensure all the temporary files we create during test runs use the host file
 # system (for performance) and are destroyed between runs.
 volume "/tmp"
-
-# Preserve Docker layer cache between runs
-volume "$(container_name)_docker:/var/lib/docker"
 
 default_command bash

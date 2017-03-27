@@ -480,7 +480,10 @@ extend_container() {
 
   # set image and container names accordingly
   container_name "$(convert_to_valid_container_name $1)"
-  image "dock-image:$container_name"
+  # We use the dock container image to store container state (with the exception of volume details
+  # for obvious reasons with respect to how Docker operates) and inherit from during subsequent
+  # extension operations
+  local container_image="dock-image:$container_name"
 
   # set workspace directory to project repo root
   workspace_path "$(pwd)"
@@ -505,38 +508,34 @@ extend_container() {
     exec "${command_args[@]}"
   fi
 
-  # Compile run args based on current configuration
-  compile_run_args
-
-  # If the targeted dock environment does not exist, create a new image
-  # based on the dock configuration of the current project
+  # Proceed to launch extended dock container...
   temp_container_name="temp"
   if ! container_exists $container_name; then
-    if [ -n "$dockerfile" ]; then
-      notice "Dock container $container_name not found, extending $project into new Dock $container_name..."
-      if $pull; then
-        build_args+=("--pull")
-      fi
-      build_args+=("--file" "$dockerfile" "--tag" "$image" "$build_context")
-      if quiet; then
-        "${build_args[@]}" 2>&1 >/dev/null
-      else
-        "${build_args[@]}"
-      fi
-      notice "$dockerfile built into $image!"
-    else
-      error "Must specify a Dockerfile to build and run!"
-      info "(is there a $default_conf_file file in your current directory?)"
-      return 1
+    # If the targeted dock environment does not exist, create a new image
+    # based on the dock configuration of the current project
+    notice "Dock container $container_name NOT found; creating new Dock $container_name for $project..."
+    echo "IMAGE" $image
+    if [ -z $image ] && [ -n "$dockerfile" ]; then
+      image "$(grep -n 'FROM' $dockerfile | awk '{ print $2 }')"
     fi
   else
     # Target container matches existing Dock container, reuse...
+    info "Dock container $container_name found, extending for $project..."
+    image $container_image
+
     # Rename existing container to $temp_container_name so that we can launch the replacement container with
     # the exact same name and still have access to the previous version of the container's
     # volumes
     docker rename $container_name $temp_container_name
     run_args+=("--volumes-from" "$temp_container_name")
+
+    # Ensure we don't attempt to pull the temp FROM image from the hub since it is only for intermediary
+    # construction purposes and should not exist
+    pull=false
   fi
+
+  # Compile run args based on current configuration
+  compile_run_args
 
   run_args+=("$image")
   if [ "${#command_args[@]}" -gt 0 ]; then
@@ -549,8 +548,7 @@ extend_container() {
     return 1
   fi
 
-  docker commit $container_name $image 2>&1 >/dev/null
-
+  docker commit $container_name $container_image 2>&1 >/dev/null
   # Cleanup intermediary temporary container if necessary
   if container_exists $temp_container_name; then
     docker stop $temp_container_name 2>&1 >/dev/null || true
@@ -788,8 +786,8 @@ initialize_variables() {
   detach=false
   detach_keys="ctrl-x,x" # Ctrl-P is a useful shortcut when using Bash
   dock_in_dock=false # Don't create recursive Dock containers by default
-  pull=false
-  privileged=false
+  pull=true
+  privileged=true
   env=()
   optional_env=()
   required_env=()
@@ -921,6 +919,10 @@ compile_run_args() {
     done
   fi
 
+  # Ensure container runs as the current user, otherwise files
+  # in the repo may have their ownership changed to the wrong user
+  env_var APP_UID $(user_id)
+  env_var APP_GID $(group_id)
   if [ ${#required_env[@]} -gt 0 ]; then
     for var_name in "${required_env[@]}"; do
       if [ -z "${!var_name+x}" ]; then
@@ -963,6 +965,12 @@ compile_run_args() {
 
   # Mount repository in the container
   volumes+=("$repo_root:$workspace_dir:rw")
+  # Only provide a single mount point for docker per Dock container
+  if ! docker volume inspect "$(container_name)_docker" 2>&1 >/dev/null; then
+    volume "$(repo_path)/dock/start-docker:/entrypoint.d/start-docker:ro"
+    volume "$(container_name)_docker:/var/lib/docker:rw"
+  fi
+
   if [ ${#volumes[@]} -gt 0 ]; then
     for v in "${volumes[@]}"; do
       run_args+=("--volume" "$v")
